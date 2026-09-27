@@ -93,37 +93,53 @@ function Test-Port {
     return $connected
 }
 
-# ---- 修复 GitHub 网络（自动切换 hosts）----
+# ---- 修复 GitHub 网络（自动切换 hosts，支持强制换节点）----
 function Repair-GitHubNetwork {
+    param([switch]$ForceSwitch)
     Write-Log "[网络] 检测 GitHub 连通性..."
+    # 读取当前 hosts 指向
+    $currentIp = $null
+    $hostsContent = Get-Content $script:HostsFile -ErrorAction SilentlyContinue
+    $githubLine = $hostsContent | Where-Object { $_ -match 'github\.com' } | Select-Object -First 1
+    if ($githubLine -match '^\s*(\d+\.\d+\.\d+\.\d+)') { $currentIp = $Matches[1] }
+    if ($ForceSwitch -and $currentIp) { Write-Log "[网络] 当前节点 $currentIp 异常，尝试切换其他节点..." }
+    # 依次测试各节点，收集可用 IP
+    $reachable = @()
     foreach ($ip in $script:GitHubIPs) {
         Write-Log "[网络] 测试 $ip ..."
-        if (Test-Port -IP $ip) {
-            # 已通，检查 hosts 是否指向这个 IP
-            $hostsContent = Get-Content $script:HostsFile -ErrorAction SilentlyContinue
-            $githubLine = $hostsContent | Where-Object { $_ -match 'github\.com' } | Select-Object -First 1
-            if ($githubLine -and $githubLine -match [regex]::Escape($ip)) {
-                Write-Log "[网络] hosts 已指向可用 IP $ip，无需修改"
-                return $true
-            }
-            # 修改 hosts
-            Write-Log "[网络] 切换 hosts 指向 $ip ..."
-            try {
-                $newContent = $hostsContent | Where-Object { $_ -notmatch 'github\.com' }
-                $newContent += "$ip github.com"
-                $newContent += "# GitHub上传工具管理"
-                Set-Content -Path $script:HostsFile -Value $newContent -Force
-                Clear-DnsCache
-                Write-Log "[网络] 已切换到 $ip"
-                return $true
-            } catch {
-                Write-Log "[网络] hosts 修改失败: $($_.Exception.Message)"
-                return $false
-            }
+        if (Test-Port -IP $ip) { $reachable += $ip }
+    }
+    if ($reachable.Count -eq 0) {
+        Write-Log "[网络] 所有节点均不通，请检查网络或稍后重试"
+        return $false
+    }
+    # 选择目标节点
+    if (-not $ForceSwitch) {
+        if ($currentIp -and ($reachable -contains $currentIp)) {
+            Write-Log "[网络] hosts 已指向可用 IP $currentIp，无需修改"
+            return $true
         }
     }
-    Write-Log "[网络] 所有 IP 均不通，请检查网络或联系服务商"
-    return $false
+    $target = $reachable | Where-Object { $_ -ne $currentIp } | Select-Object -First 1
+    if (-not $target) { $target = $reachable[0] }
+    if ($target -eq $currentIp) {
+        Write-Log "[网络] 当前节点 $currentIp 为唯一可用节点，保持不变"
+        return $true
+    }
+    # 切换 hosts
+    Write-Log "[网络] 切换 hosts 指向 $target ..."
+    try {
+        $newContent = $hostsContent | Where-Object { $_ -notmatch 'github\.com' }
+        $newContent += "$target github.com"
+        $newContent += "# GitHub上传工具管理"
+        Set-Content -Path $script:HostsFile -Value $newContent -Force
+        try { Clear-DnsClientCache -ErrorAction Stop } catch { & ipconfig.exe /flushdns | Out-Null }
+        Write-Log "[网络] 已切换到 $target（DNS 缓存已刷新）"
+        return $true
+    } catch {
+        Write-Log "[网络] hosts 修改失败: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 # ---- 带重试的 git 操作 ----
@@ -140,7 +156,7 @@ function Invoke-Git {
         Write-Log "[git] 第 $i 次失败: $($output | Out-String)"
         if ($output -match 'Connection was reset|Could not connect|timed out|Failed to connect') {
             Write-Log "[git] 网络问题，尝试修复..."
-            if (-not (Repair-GitHubNetwork)) { return @{ Success = $false; Output = $output } }
+            if (-not (Repair-GitHubNetwork -ForceSwitch)) { return @{ Success = $false; Output = $output } }
         } else {
             if ($i -lt $MaxRetry) { Start-Sleep -Seconds 2 }
         }
