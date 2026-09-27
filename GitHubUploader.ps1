@@ -130,7 +130,11 @@ function Repair-GitHubNetwork {
 function Invoke-Git {
     param([string[]]$Arguments, [string]$WorkingDir, [int]$MaxRetry = 3)
     for ($i = 1; $i -le $MaxRetry; $i++) {
-        $output = & git -C $WorkingDir @Arguments 2>&1
+        if ([string]::IsNullOrWhiteSpace($WorkingDir)) {
+            $output = & git @Arguments 2>&1
+        } else {
+            $output = & git -C $WorkingDir @Arguments 2>&1
+        }
         $exitCode = $LASTEXITCODE
         if ($exitCode -eq 0) { return @{ Success = $true; Output = $output } }
         Write-Log "[git] 第 $i 次失败: $($output | Out-String)"
@@ -207,22 +211,21 @@ function Start-OverwriteUpload {
     $repoPath = Ensure-Repo -RepoName $RepoName -Account $Account
     if (-not $repoPath) { return $false }
 
-    # 打标签保留旧版
-    if ($Version -match '^v\d+\.\d+$') {
-        $oldVersion = $Version -replace 'v(\d+)\.(\d+)', { 
-            $maj = [int]$_.Groups[1].Value; $min = [int]$_.Groups[2].Value
-            if ($min -gt 0) { "v$maj.$($min-1)" } else { "v$($maj-1).9" }
-        }
-    } else {
-        $oldVersion = "v1.0"
+    # 打标签保留旧版（用简单字符串计算，避免 -replace 脚本块在 PS 5.1 的兼容问题）
+    $oldVersion = $null
+    if ($Version -match '^v(\d+)\.(\d+)$') {
+        $maj = [int]$Matches[1]; $min = [int]$Matches[2]
+        if ($min -gt 0) { $oldVersion = "v$maj.$($min - 1)" } else { $oldVersion = "v$($maj - 1).9" }
     }
-    Write-Log "[标签] 给当前旧版打标签 $oldVersion ..."
-    $tagResult = Invoke-Git -Arguments @('tag',$oldVersion) -WorkingDir $repoPath -MaxRetry 1
-    if ($tagResult.Success) {
-        Invoke-Git -Arguments @('push','origin',$oldVersion) -WorkingDir $repoPath | Out-Null
-        Write-Log "[标签] 旧版已标记为 $oldVersion"
-    } else {
-        Write-Log "[标签] �oldVersion 已存在或跳过"
+    if ($oldVersion) {
+        Write-Log "[标签] 给当前旧版打标签 $oldVersion ..."
+        $tagResult = Invoke-Git -Arguments @('tag',$oldVersion) -WorkingDir $repoPath -MaxRetry 1
+        if ($tagResult.Success) {
+            Invoke-Git -Arguments @('push','origin',$oldVersion) -WorkingDir $repoPath | Out-Null
+            Write-Log "[标签] 旧版已标记为 $oldVersion"
+        } else {
+            Write-Log "[标签] $oldVersion 已存在或跳过"
+        }
     }
 
     # 清空仓库（保留 .git）
@@ -250,8 +253,8 @@ function Start-OverwriteUpload {
     Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     Write-Log "[覆盖] 新文件已就位"
 
-    # 提交推送
-    return Start-CommitAndPush -RepoPath $repoPath -Message "v$Version $Desc" -Tag $Version -Owner $Account
+    # 提交推送（Version 已含 v 前缀，不再额外拼 v）
+    return Start-CommitAndPush -RepoPath $repoPath -Message "$Version $Desc" -Tag $Version -Owner $Account
 }
 
 # ---- 增量推送：直接提交本地修改 ----
@@ -279,7 +282,7 @@ function Start-IncrementalPush {
     $changeCount = ($status | Measure-Object).Count
     Write-Log "[增量] 检测到 $changeCount 个文件变动"
 
-    return Start-CommitAndPush -RepoPath $repoPath -Message "v$Version $Desc" -Tag $Version -Owner $Account
+    return Start-CommitAndPush -RepoPath $repoPath -Message "$Version $Desc" -Tag $Version -Owner $Account
 }
 
 # ---- 提交并推送 ----
@@ -293,8 +296,14 @@ function Start-CommitAndPush {
     Write-Log "[提交] 提交: $Message"
     $commitResult = Invoke-Git -Arguments @('commit','-m',$Message) -WorkingDir $RepoPath -MaxRetry 1
     if (-not $commitResult.Success) {
-        Write-Log "[警告] commit 输出: $($commitResult.Output | Out-String)"
-        return $false
+        $commitOut = $commitResult.Output | Out-String
+        # nothing to commit 不算错误，继续推送（本地可能有未推送的提交）
+        if ($commitOut -match 'nothing to commit') {
+            Write-Log "[提交] 无新改动需要提交，继续推送已有的本地提交"
+        } else {
+            Write-Log "[警告] commit 输出: $commitOut"
+            return $false
+        }
     }
 
     if ($Tag -match '^v\d+\.\d+$') {
